@@ -12,7 +12,7 @@ android {
 
     defaultConfig {
         applicationId = "com.hafran.estrestest"
-        minSdk = 24
+        minSdk = 28
         targetSdk = 37
         versionCode = 1
         versionName = "1.0"
@@ -56,5 +56,9 @@ dependencies {
     implementation("androidx.camera:camera-camera2:1.5.2")
     implementation("androidx.camera:camera-lifecycle:1.5.2")
     implementation("androidx.camera:camera-view:1.5.2")
+
+
+// MediaPipe Tasks Vision
+    implementation("com.google.mediapipe:tasks-vision:0.10.14")
 
 }

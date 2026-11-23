@@ -44,6 +44,17 @@
         app:layout_constraintEnd_toEndOf="parent"
         android:layout_marginTop="20dp" />
 
+    <com.hafran.estrestest.FaceOverlayView
+        android:id="@+id/faceOverlay"
+        android:layout_width="280dp"
+        android:layout_height="360dp"
+        android:clickable="false"
+        android:focusable="false"
+        app:layout_constraintTop_toTopOf="@id/cameraPreview"
+        app:layout_constraintBottom_toBottomOf="@id/cameraPreview"
+        app:layout_constraintStart_toStartOf="@id/cameraPreview"
+        app:layout_constraintEnd_toEndOf="@id/cameraPreview" />
+
     <Button
         android:id="@+id/btnBack"
         android:layout_width="0dp"
