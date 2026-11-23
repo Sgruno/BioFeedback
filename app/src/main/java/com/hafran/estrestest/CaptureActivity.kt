@@ -15,7 +15,12 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.UseCaseGroup
+import androidx.camera.view.transform.CoordinateTransform
+import androidx.camera.view.transform.ImageProxyTransformFactory
+import androidx.camera.view.transform.OutputTransform
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.TransformExperimental
 import androidx.core.content.ContextCompat
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.hafran.estrestest.databinding.ActivityCaptureBinding
@@ -24,6 +29,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 
+@TransformExperimental
 class CaptureActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityCaptureBinding
@@ -33,6 +39,14 @@ class CaptureActivity : AppCompatActivity() {
     private val isProcessing = AtomicBoolean(false)
 
     private var detectorReady = false
+
+    private val imageProxyTransformFactory =
+        ImageProxyTransformFactory().apply {
+            setUsingCropRect(false)
+            setUsingRotationDegrees(true)
+        }
+
+    private var pendingOutputTransform: OutputTransform? = null
 
     // Solicitud de permiso para utilizar la cámara.
     private val cameraPermission = registerForActivityResult(
@@ -140,14 +154,52 @@ class CaptureActivity : AppCompatActivity() {
 
                         // Enviamos las regiones a la vista de dibujo.
                         // Las coordenadas todavía están normalizadas.
+                        // Guardamos la transformación correspondiente al fotograma procesado.
+                        val sourceTransform = pendingOutputTransform
+
                         runOnUiThread {
 
+                            // Obtenemos la transformación de la vista previa.
+                            val targetTransform = binding.cameraPreview.outputTransform
+
+                            if (sourceTransform == null || targetTransform == null) {
+                                Log.w("FaceTracking", "Transformación de cámara no disponible")
+                                return@runOnUiThread
+                            }
+
+                            // Creamos la transformación entre el análisis y la vista previa.
+                            val coordinateTransform = CoordinateTransform(
+                                sourceTransform,
+                                targetTransform
+                            )
+
+                            // Convertimos cada región de coordenadas normalizadas
+                            // a coordenadas de pantalla.
+                            fun convertToView(rect: RectF): RectF {
+
+                                val convertedRect = RectF(
+                                    rect.left * input.width,
+                                    rect.top * input.height,
+                                    rect.right * input.width,
+                                    rect.bottom * input.height
+                                )
+
+                                coordinateTransform.mapRect(convertedRect)
+
+                                return convertedRect
+                            }
+
+                            val foreheadView = convertToView(forehead)
+                            val leftCheekView = convertToView(leftCheek)
+                            val rightCheekView = convertToView(rightCheek)
+
+                            // Enviamos las regiones transformadas al dibujo.
                             binding.faceOverlay.updateRegions(
-                                forehead,
-                                leftCheek,
-                                rightCheek,
-                                input.width,
-                                input.height
+                                foreheadView,
+                                leftCheekView,
+                                rightCheekView,
+                                binding.cameraPreview.width,
+                                binding.cameraPreview.height
                             )
                         }
 
@@ -295,6 +347,8 @@ class CaptureActivity : AppCompatActivity() {
 
                 try {
 
+                    pendingOutputTransform =
+                        imageProxyTransformFactory.getOutputTransform(imageProxy)
                     // Convertimos la imagen de cámara a Bitmap.
                     val bitmap = imageProxyToBitmap(imageProxy)
 
@@ -336,11 +390,23 @@ class CaptureActivity : AppCompatActivity() {
                 cameraProvider.unbindAll()
 
                 // Vinculamos la cámara, la vista previa y el análisis.
+                val viewPort = binding.cameraPreview.viewPort
+
+                if (viewPort == null) {
+                    Log.e("CameraX", "No se pudo obtener el ViewPort")
+                    return@addListener
+                }
+
+                val useCaseGroup = UseCaseGroup.Builder()
+                    .setViewPort(viewPort)
+                    .addUseCase(preview)
+                    .addUseCase(imageAnalysis)
+                    .build()
+
                 cameraProvider.bindToLifecycle(
                     this,
                     cameraSelector,
-                    preview,
-                    imageAnalysis
+                    useCaseGroup
                 )
 
                 Log.d(
@@ -442,6 +508,8 @@ class CaptureActivity : AppCompatActivity() {
         super.onDestroy()
 
         detectorReady = false
+
+
 
         if (::faceLandmarkerHelper.isInitialized) {
             faceLandmarkerHelper.close()
