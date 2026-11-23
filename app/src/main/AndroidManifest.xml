@@ -13,7 +13,6 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.EstresTest">
-
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -27,6 +26,10 @@
         <activity
             android:name=".CaptureActivity"
             android:exported="false" />
+        <activity
+            android:name=".BiofeedbackActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
     </application>
 
 </manifest>

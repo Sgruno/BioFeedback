@@ -4,11 +4,18 @@ package com.hafran.estrestest
 import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.RectF
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
+import android.view.View
 import android.widget.Toast
+import android.content.Intent
+
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
@@ -16,21 +23,26 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.UseCaseGroup
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.TransformExperimental
 import androidx.camera.view.transform.CoordinateTransform
 import androidx.camera.view.transform.ImageProxyTransformFactory
 import androidx.camera.view.transform.OutputTransform
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.view.TransformExperimental
 import androidx.core.content.ContextCompat
+
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.hafran.estrestest.databinding.ActivityCaptureBinding
+
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.abs
 
 @TransformExperimental
 class CaptureActivity : AppCompatActivity() {
+
+    // ================================================
+    // VARIABLES PRINCIPALES
+    // ================================================
 
     private lateinit var binding: ActivityCaptureBinding
     private lateinit var faceLandmarkerHelper: FaceLandmarkerHelper
@@ -38,7 +50,21 @@ class CaptureActivity : AppCompatActivity() {
 
     private val isProcessing = AtomicBoolean(false)
 
+    @Volatile
     private var detectorReady = false
+
+    // ================================================
+    // VARIABLES PARA PROCESAMIENTO DE IMÁGENES
+    // ================================================
+
+    @Volatile
+    private var pendingBitmap: Bitmap? = null
+
+    @Volatile
+    private var pendingOutputTransform: OutputTransform? = null
+
+    @Volatile
+    private var pendingTimestampMs: Long = 0L
 
     private val imageProxyTransformFactory =
         ImageProxyTransformFactory().apply {
@@ -46,23 +72,85 @@ class CaptureActivity : AppCompatActivity() {
             setUsingRotationDegrees(true)
         }
 
-    private var pendingOutputTransform: OutputTransform? = null
+    // ================================================
+    // LISTAS DE MUESTRAS RGB
+    // ================================================
 
-    // Solicitud de permiso para utilizar la cámara.
-    private val cameraPermission = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
+    private val foreheadSamples = mutableListOf<RgbSample>()
+    private val leftCheekSamples = mutableListOf<RgbSample>()
+    private val rightCheekSamples = mutableListOf<RgbSample>()
 
-        if (granted) {
-            startCamera()
-        } else {
-            Toast.makeText(
-                this,
-                "Se necesita permiso para utilizar la cámara",
-                Toast.LENGTH_LONG
-            ).show()
+    // ================================================
+    // TEMPORIZADOR DE CAPTURA
+    // ================================================
+
+    private val captureDurationMs = 40_000L
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    @Volatile
+    private var isCapturing = false
+
+    private var hasCaptureStarted = false
+
+    private var captureElapsedBeforePause = 0L
+
+    private var captureSegmentStart = 0L
+
+    private val captureTimer = object : Runnable {
+
+        override fun run() {
+
+            if (!isCapturing) return
+
+            val currentElapsed =
+                captureElapsedBeforePause +
+                        (SystemClock.elapsedRealtime() - captureSegmentStart)
+
+            val progress =
+                currentElapsed.toFloat() / captureDurationMs
+
+            binding.faceOverlay.setCaptureProgress(progress)
+
+            if (currentElapsed >= captureDurationMs) {
+
+                finishCapture()
+
+            } else {
+
+                mainHandler.postDelayed(this, 50)
+            }
         }
     }
+
+    // ================================================
+    // PERMISO DE CÁMARA
+    // ================================================
+
+    private val requestCameraPermission =
+        registerForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { granted ->
+
+            if (granted) {
+
+                startCamera()
+
+            } else {
+
+                Toast.makeText(
+                    this,
+                    "Se necesita permiso para utilizar la cámara",
+                    Toast.LENGTH_LONG
+                ).show()
+
+                finish()
+            }
+        }
+
+    // ================================================
+    // ONCREATE
+    // ================================================
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -78,171 +166,226 @@ class CaptureActivity : AppCompatActivity() {
             faceLandmarkerHelper = FaceLandmarkerHelper(
                 this,
 
-                // Recibimos los resultados de la detección facial.
+                // Callback de resultados de detección facial.
                 { result, input ->
 
-                    val facesDetected = result.faceLandmarks().size
+                    try {
 
-                    if (facesDetected == 0) {
-                        Log.w("FaceTracking", "Se perdió el rostro")
-                    } else {
-                        Log.d("FaceTracking", "Rostro localizado correctamente")
-                    }
+                        val landmarks =
+                            result.faceLandmarks().firstOrNull()
 
-                    if (facesDetected > 0) {
+                        if (landmarks == null) {
 
-                        val landmarks = result.faceLandmarks()[0]
+                            pendingBitmap = null
 
-                        Log.d(
-                            "MediaPipe",
-                            "Puntos faciales detectados: ${landmarks.size}"
-                        )
-
-                        // Calculamos el ancho aproximado del rostro.
-                        val faceWidth = abs(
-                            landmarks[454].x() - landmarks[234].x()
-                        )
-
-                        // Calculamos la región de la frente.
-                        val forehead = RectF(
-                            landmarks[10].x() - faceWidth * 0.15f,
-                            landmarks[10].y() + faceWidth * 0.03f,
-                            landmarks[10].x() + faceWidth * 0.15f,
-                            landmarks[10].y() + faceWidth * 0.17f
-                        )
-
-                        // Calculamos la región de la mejilla izquierda.
-                        val leftCheek = RectF(
-                            landmarks[117].x() - faceWidth * 0.08f,
-                            landmarks[117].y() - faceWidth * 0.06f,
-                            landmarks[117].x() + faceWidth * 0.08f,
-                            landmarks[117].y() + faceWidth * 0.06f
-                        )
-
-                        // Calculamos la región de la mejilla derecha.
-                        val rightCheek = RectF(
-                            landmarks[346].x() - faceWidth * 0.08f,
-                            landmarks[346].y() - faceWidth * 0.06f,
-                            landmarks[346].x() + faceWidth * 0.08f,
-                            landmarks[346].y() + faceWidth * 0.06f
-                        )
-
-                        // Registramos las regiones en Logcat.
-                        logRoi(
-                            "FRENTE",
-                            landmarks[10].x(),
-                            landmarks[10].y() + faceWidth * 0.10f,
-                            faceWidth * 0.30f,
-                            faceWidth * 0.14f
-                        )
-
-                        logRoi(
-                            "MEJILLA A",
-                            landmarks[117].x(),
-                            landmarks[117].y(),
-                            faceWidth * 0.16f,
-                            faceWidth * 0.12f
-                        )
-
-                        logRoi(
-                            "MEJILLA B",
-                            landmarks[346].x(),
-                            landmarks[346].y(),
-                            faceWidth * 0.16f,
-                            faceWidth * 0.12f
-                        )
-
-                        // Enviamos las regiones a la vista de dibujo.
-                        // Las coordenadas todavía están normalizadas.
-                        // Guardamos la transformación correspondiente al fotograma procesado.
-                        val sourceTransform = pendingOutputTransform
-
-                        runOnUiThread {
-
-                            // Obtenemos la transformación de la vista previa.
-                            val targetTransform = binding.cameraPreview.outputTransform
-
-                            if (sourceTransform == null || targetTransform == null) {
-                                Log.w("FaceTracking", "Transformación de cámara no disponible")
-                                return@runOnUiThread
+                            runOnUiThread {
+                                binding.faceOverlay.clearRegions()
                             }
 
-                            // Creamos la transformación entre el análisis y la vista previa.
-                            val coordinateTransform = CoordinateTransform(
-                                sourceTransform,
-                                targetTransform
-                            )
+                        } else {
 
-                            // Convertimos cada región de coordenadas normalizadas
-                            // a coordenadas de pantalla.
-                            fun convertToView(rect: RectF): RectF {
+                            // =================================
+                            // CALCULAR REGIONES FACIALES
+                            // =================================
 
-                                val convertedRect = RectF(
-                                    rect.left * input.width,
-                                    rect.top * input.height,
-                                    rect.right * input.width,
-                                    rect.bottom * input.height
+                            val faceWidth =
+                                kotlin.math.abs(
+                                    landmarks[454].x() -
+                                            landmarks[234].x()
                                 )
 
-                                coordinateTransform.mapRect(convertedRect)
+                            // Frente.
+                            val forehead = RectF(
+                                landmarks[10].x() - faceWidth * 0.15f,
+                                landmarks[10].y() + faceWidth * 0.03f,
+                                landmarks[10].x() + faceWidth * 0.15f,
+                                landmarks[10].y() + faceWidth * 0.17f
+                            )
 
-                                return convertedRect
+                            // Mejilla izquierda.
+                            val leftCheek = RectF(
+                                landmarks[117].x() - faceWidth * 0.08f,
+                                landmarks[117].y() - faceWidth * 0.06f,
+                                landmarks[117].x() + faceWidth * 0.08f,
+                                landmarks[117].y() + faceWidth * 0.06f
+                            )
+
+                            // Mejilla derecha.
+                            val rightCheek = RectF(
+                                landmarks[346].x() - faceWidth * 0.08f,
+                                landmarks[346].y() - faceWidth * 0.06f,
+                                landmarks[346].x() + faceWidth * 0.08f,
+                                landmarks[346].y() + faceWidth * 0.06f
+                            )
+
+                            // =================================
+                            // OBTENER FOTOGRAMA Y TRANSFORMACIÓN
+                            // =================================
+
+                            val sourceTransform =
+                                pendingOutputTransform
+
+                            val frameBitmap =
+                                pendingBitmap
+
+                            val timestamp =
+                                pendingTimestampMs
+
+                            // =================================
+                            // EXTRAER VALORES RGB
+                            // =================================
+
+                            if (isCapturing && frameBitmap != null) {
+
+                                val foreheadRgb =
+                                    calculateAverageRgb(
+                                        frameBitmap,
+                                        forehead
+                                    )
+
+                                val leftCheekRgb =
+                                    calculateAverageRgb(
+                                        frameBitmap,
+                                        leftCheek
+                                    )
+
+                                val rightCheekRgb =
+                                    calculateAverageRgb(
+                                        frameBitmap,
+                                        rightCheek
+                                    )
+
+                                if (
+                                    foreheadRgb != null &&
+                                    leftCheekRgb != null &&
+                                    rightCheekRgb != null
+                                ) {
+
+                                    synchronized(foreheadSamples) {
+
+                                        foreheadSamples.add(
+                                            RgbSample(
+                                                red = foreheadRgb.first,
+                                                green = foreheadRgb.second,
+                                                blue = foreheadRgb.third,
+                                                timestamp = timestamp
+                                            )
+                                        )
+
+                                        leftCheekSamples.add(
+                                            RgbSample(
+                                                red = leftCheekRgb.first,
+                                                green = leftCheekRgb.second,
+                                                blue = leftCheekRgb.third,
+                                                timestamp = timestamp
+                                            )
+                                        )
+
+                                        rightCheekSamples.add(
+                                            RgbSample(
+                                                red = rightCheekRgb.first,
+                                                green = rightCheekRgb.second,
+                                                blue = rightCheekRgb.third,
+                                                timestamp = timestamp
+                                            )
+                                        )
+                                    }
+
+                                    Log.d(
+                                        "RGB",
+                                        "Muestras: " +
+                                                "Frente=${foreheadSamples.size}, " +
+                                                "MejillaA=${leftCheekSamples.size}, " +
+                                                "MejillaB=${rightCheekSamples.size}"
+                                    )
+                                }
                             }
 
-                            val foreheadView = convertToView(forehead)
-                            val leftCheekView = convertToView(leftCheek)
-                            val rightCheekView = convertToView(rightCheek)
+                            // =================================
+                            // TRANSFORMAR COORDENADAS
+                            // =================================
 
-                            // Enviamos las regiones transformadas al dibujo.
-                            binding.faceOverlay.updateRegions(
-                                foreheadView,
-                                leftCheekView,
-                                rightCheekView,
-                                binding.cameraPreview.width,
-                                binding.cameraPreview.height
-                            )
+                            runOnUiThread {
+
+                                if (
+                                    sourceTransform == null ||
+                                    binding.cameraPreview.outputTransform == null
+                                ) {
+                                    return@runOnUiThread
+                                }
+
+                                val coordinateTransform =
+                                    CoordinateTransform(
+                                        sourceTransform,
+                                        binding.cameraPreview.outputTransform!!
+                                    )
+
+                                fun convertToView(rect: RectF): RectF {
+
+                                    val convertedRect = RectF(
+                                        rect.left * input.width,
+                                        rect.top * input.height,
+                                        rect.right * input.width,
+                                        rect.bottom * input.height
+                                    )
+
+                                    coordinateTransform.mapRect(convertedRect)
+
+                                    return convertedRect
+                                }
+
+                                val foreheadView =
+                                    convertToView(forehead)
+
+                                val leftCheekView =
+                                    convertToView(leftCheek)
+
+                                val rightCheekView =
+                                    convertToView(rightCheek)
+
+                                binding.faceOverlay.updateRegions(
+                                    foreheadView,
+                                    leftCheekView,
+                                    rightCheekView,
+                                    binding.cameraPreview.width,
+                                    binding.cameraPreview.height
+                                )
+                            }
+
+                            pendingBitmap = null
                         }
 
-                    } else {
+                    } catch (exception: Exception) {
 
-                        // Si no se detecta un rostro, limpiamos el dibujo.
-                        runOnUiThread {
-                            binding.faceOverlay.clearRegions()
-                        }
+                        Log.e(
+                            "FaceTracking",
+                            "Error al procesar resultados faciales",
+                            exception
+                        )
+
+                    } finally {
+
+                        isProcessing.set(false)
                     }
-
-                    Log.d(
-                        "MediaPipe",
-                        "Rostros detectados: $facesDetected"
-                    )
-
-                    // Permitimos procesar el siguiente fotograma.
-                    isProcessing.set(false)
                 },
 
-                // Recibimos posibles errores de MediaPipe.
+                // Callback de errores de MediaPipe.
                 { error ->
 
                     Log.e(
                         "MediaPipe",
-                        "Error en Face Landmarker",
+                        "Error del detector facial",
                         error
                     )
 
+                    pendingBitmap = null
                     isProcessing.set(false)
                 }
             )
 
             detectorReady = true
 
-            Log.d(
-                "MediaPipe",
-                "Detector facial inicializado correctamente"
-            )
-
         } catch (exception: Exception) {
-
-            detectorReady = false
 
             Log.e(
                 "MediaPipe",
@@ -252,42 +395,64 @@ class CaptureActivity : AppCompatActivity() {
 
             Toast.makeText(
                 this,
-                "No se pudo inicializar el detector facial",
+                "No se pudo inicializar la detección facial",
                 Toast.LENGTH_LONG
             ).show()
         }
 
-        // Botón para regresar.
+        // ================================================
+        // CONFIGURAR BOTONES
+        // ================================================
+
+        // Estado inicial: pantalla de encuadre.
+        binding.btnReady.visibility = View.VISIBLE
+        binding.btnPause.visibility = View.GONE
+
+        // Botón para iniciar la captura.
+        binding.btnReady.setOnClickListener {
+
+            if (!detectorReady) {
+                Toast.makeText(
+                    this,
+                    "El detector facial todavía no está listo",
+                    Toast.LENGTH_SHORT
+                ).show()
+
+                return@setOnClickListener
+            }
+
+            binding.btnReady.visibility = View.GONE
+            binding.btnPause.visibility = View.VISIBLE
+
+            startCapture()
+        }
+
+        // Botón para pausar o continuar.
+        binding.btnPause.setOnClickListener {
+
+            if (isCapturing) {
+
+                pauseCapture()
+
+            } else {
+
+                startCapture()
+            }
+        }
+
+        // Botón para regresar al menú.
         binding.btnBack.setOnClickListener {
             finish()
         }
 
-        // Comprobamos el permiso de cámara.
+        // Comprobar permiso de cámara.
         checkCameraPermission()
     }
 
-    // Calcula los límites de una región facial para Logcat.
-    private fun logRoi(
-        name: String,
-        centerX: Float,
-        centerY: Float,
-        width: Float,
-        height: Float
-    ) {
+    // ================================================
+    // COMPROBAR PERMISO DE CÁMARA
+    // ================================================
 
-        val left = (centerX - width / 2).coerceIn(0f, 1f)
-        val right = (centerX + width / 2).coerceIn(0f, 1f)
-
-        val top = (centerY - height / 2).coerceIn(0f, 1f)
-        val bottom = (centerY + height / 2).coerceIn(0f, 1f)
-
-        Log.d(
-            "FaceROI",
-            "$name: izquierda=$left, derecha=$right, arriba=$top, abajo=$bottom"
-        )
-    }
-
-    // Comprobamos si tenemos permiso para utilizar la cámara.
     private fun checkCameraPermission() {
 
         if (
@@ -301,142 +466,228 @@ class CaptureActivity : AppCompatActivity() {
 
         } else {
 
-            cameraPermission.launch(Manifest.permission.CAMERA)
+            requestCameraPermission.launch(
+                Manifest.permission.CAMERA
+            )
         }
     }
 
-    // Iniciamos CameraX.
-    private fun startCamera() {
+    // ================================================
+    // INICIAR O REANUDAR CAPTURA
+    // ================================================
 
-        val cameraProviderFuture =
-            ProcessCameraProvider.getInstance(this)
+    private fun startCapture() {
 
-        cameraProviderFuture.addListener({
+        if (isCapturing || !detectorReady) return
 
-            val cameraProvider = cameraProviderFuture.get()
+        if (!hasCaptureStarted) {
 
-            // Configuramos la vista previa.
-            val preview = Preview.Builder().build()
-
-            preview.surfaceProvider =
-                binding.cameraPreview.surfaceProvider
-
-            // Configuramos el análisis de imágenes.
-            val imageAnalysis = ImageAnalysis.Builder()
-                .setBackpressureStrategy(
-                    ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST
-                )
-                .setOutputImageFormat(
-                    ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888
-                )
-                .build()
-
-            // Procesamos las imágenes de la cámara.
-            imageAnalysis.setAnalyzer(analysisExecutor) { imageProxy ->
-
-                if (!detectorReady || isFinishing || isDestroyed) {
-                    imageProxy.close()
-                    return@setAnalyzer
-                }
-
-                // Evitamos procesar varios fotogramas simultáneamente.
-                if (!isProcessing.compareAndSet(false, true)) {
-                    imageProxy.close()
-                    return@setAnalyzer
-                }
-
-                try {
-
-                    pendingOutputTransform =
-                        imageProxyTransformFactory.getOutputTransform(imageProxy)
-                    // Convertimos la imagen de cámara a Bitmap.
-                    val bitmap = imageProxyToBitmap(imageProxy)
-
-                    // Creamos la imagen que recibe MediaPipe.
-                    val mpImage = BitmapImageBuilder(bitmap).build()
-
-                    // Utilizamos el tiempo de la cámara en milisegundos.
-                    val timestamp =
-                        imageProxy.imageInfo.timestamp / 1_000_000
-
-                    // Enviamos la imagen al detector facial.
-                    faceLandmarkerHelper.detectAsync(
-                        mpImage,
-                        timestamp
-                    )
-
-                } catch (exception: Exception) {
-
-                    isProcessing.set(false)
-
-                    Log.e(
-                        "MediaPipe",
-                        "Error al procesar imagen",
-                        exception
-                    )
-
-                } finally {
-
-                    imageProxy.close()
-                }
+            synchronized(foreheadSamples) {
+                foreheadSamples.clear()
+                leftCheekSamples.clear()
+                rightCheekSamples.clear()
             }
 
-            // Seleccionamos la cámara frontal.
-            val cameraSelector =
-                CameraSelector.DEFAULT_FRONT_CAMERA
+            binding.faceOverlay.resetCaptureProgress()
 
-            try {
+            hasCaptureStarted = true
+            captureElapsedBeforePause = 0L
 
-                cameraProvider.unbindAll()
+            binding.txtTitle.text = "Señal en curso"
 
-                // Vinculamos la cámara, la vista previa y el análisis.
-                val viewPort = binding.cameraPreview.viewPort
+            binding.txtInstructions.text =
+                "Mantén tu rostro dentro del óvalo"
 
-                if (viewPort == null) {
-                    Log.e("CameraX", "No se pudo obtener el ViewPort")
-                    return@addListener
-                }
+            binding.txtLighting.visibility = View.GONE
+        }
 
-                val useCaseGroup = UseCaseGroup.Builder()
-                    .setViewPort(viewPort)
-                    .addUseCase(preview)
-                    .addUseCase(imageAnalysis)
-                    .build()
+        isCapturing = true
 
-                cameraProvider.bindToLifecycle(
-                    this,
-                    cameraSelector,
-                    useCaseGroup
-                )
+        captureSegmentStart =
+            SystemClock.elapsedRealtime()
 
-                Log.d(
-                    "CameraX",
-                    "Cámara y análisis iniciados correctamente"
-                )
+        binding.btnPause.text = "Pausar captura"
 
-            } catch (exception: Exception) {
+        mainHandler.removeCallbacks(captureTimer)
+        mainHandler.post(captureTimer)
 
-                Log.e(
-                    "CameraX",
-                    "Error al iniciar cámara",
-                    exception
-                )
-
-                Toast.makeText(
-                    this,
-                    "No se pudo iniciar la cámara",
-                    Toast.LENGTH_LONG
-                ).show()
-            }
-
-        }, ContextCompat.getMainExecutor(this))
+        Log.d(
+            "Capture",
+            "Captura iniciada o reanudada"
+        )
     }
 
-    // Convierte una imagen RGBA de CameraX a Bitmap.
-    private fun imageProxyToBitmap(image: ImageProxy): Bitmap {
+    // ================================================
+    // PAUSAR CAPTURA
+    // ================================================
+
+    private fun pauseCapture() {
+
+        if (!isCapturing) return
+
+        captureElapsedBeforePause +=
+            SystemClock.elapsedRealtime() - captureSegmentStart
+
+        isCapturing = false
+
+        mainHandler.removeCallbacks(captureTimer)
+
+        binding.btnPause.text = "Continuar captura"
+
+        Log.d(
+            "Capture",
+            "Captura pausada"
+        )
+    }
+
+    // ================================================
+    // FINALIZAR CAPTURA
+    // ================================================
+
+    private fun finishCapture() {
+
+        isCapturing = false
+
+        mainHandler.removeCallbacks(captureTimer)
+
+        binding.faceOverlay.setCaptureProgress(1f)
+
+        binding.txtTitle.text = "Captura completada"
+
+        binding.txtInstructions.text =
+            "Hemos terminado de recopilar la señal."
+
+        binding.btnPause.text = "Captura finalizada"
+        binding.btnPause.isEnabled = false
+
+        Log.d(
+            "Capture",
+            "Captura finalizada. Muestras: " +
+                    "Frente=${foreheadSamples.size}, " +
+                    "MejillaA=${leftCheekSamples.size}, " +
+                    "MejillaB=${rightCheekSamples.size}"
+        )
+        // Creamos el procesador de señales rPPG.
+        val rppgProcessor = RppgProcessor()
+
+// Procesamos las muestras de las tres regiones.
+        val foreheadSignal = rppgProcessor.process(foreheadSamples.toList())
+        val leftCheekSignal = rppgProcessor.process(leftCheekSamples.toList())
+        val rightCheekSignal = rppgProcessor.process(rightCheekSamples.toList())
+
+        // Estimamos la frecuencia cardíaca de cada región.
+        val foreheadBpm =
+            rppgProcessor.estimateHeartRate(foreheadSamples.toList())
+
+        val leftCheekBpm =
+            rppgProcessor.estimateHeartRate(leftCheekSamples.toList())
+
+        val rightCheekBpm =
+            rppgProcessor.estimateHeartRate(rightCheekSamples.toList())
+
+// Mostramos los resultados en Logcat.
+        Log.d("HeartRate", "Frente: $foreheadBpm BPM")
+        Log.d("HeartRate", "Mejilla A: $leftCheekBpm BPM")
+        Log.d("HeartRate", "Mejilla B: $rightCheekBpm BPM")
+
+// Comprobamos si se generaron las señales.
+        Log.d("rPPG", "Frente procesada: ${foreheadSignal != null}")
+        Log.d("rPPG", "Mejilla A procesada: ${leftCheekSignal != null}")
+        Log.d("rPPG", "Mejilla B procesada: ${rightCheekSignal != null}")
+
+// Mostramos algunos valores normalizados del canal verde.
+        foreheadSignal?.let {
+            Log.d("rPPG", "Frente - Verde: ${it.green.take(10)}")
+        }
+
+        leftCheekSignal?.let {
+            Log.d("rPPG", "Mejilla A - Verde: ${it.green.take(10)}")
+        }
+
+        rightCheekSignal?.let {
+            Log.d("rPPG", "Mejilla B - Verde: ${it.green.take(10)}")
+        }
+
+        Toast.makeText(
+            this,
+            "Captura finalizada",
+            Toast.LENGTH_SHORT
+        ).show()
+        // Pasamos automáticamente al ejercicio de respiración.
+        val intent = Intent(this, BiofeedbackActivity::class.java)
+        startActivity(intent)
+        finish()
+    }
+
+    // ================================================
+    // CALCULAR PROMEDIO RGB DE UNA REGIÓN
+    // ================================================
+
+    private fun calculateAverageRgb(
+        bitmap: Bitmap,
+        normalizedRect: RectF
+    ): Triple<Double, Double, Double>? {
+
+        val left =
+            (normalizedRect.left * bitmap.width)
+                .toInt()
+                .coerceIn(0, bitmap.width - 1)
+
+        val top =
+            (normalizedRect.top * bitmap.height)
+                .toInt()
+                .coerceIn(0, bitmap.height - 1)
+
+        val right =
+            (normalizedRect.right * bitmap.width)
+                .toInt()
+                .coerceIn(left + 1, bitmap.width)
+
+        val bottom =
+            (normalizedRect.bottom * bitmap.height)
+                .toInt()
+                .coerceIn(top + 1, bitmap.height)
+
+        var redSum = 0L
+        var greenSum = 0L
+        var blueSum = 0L
+
+        var count = 0L
+
+        for (y in top until bottom) {
+
+            for (x in left until right) {
+
+                val pixel = bitmap.getPixel(x, y)
+
+                redSum += Color.red(pixel)
+                greenSum += Color.green(pixel)
+                blueSum += Color.blue(pixel)
+
+                count++
+            }
+        }
+
+        if (count == 0L) return null
+
+        return Triple(
+            redSum.toDouble() / count,
+            greenSum.toDouble() / count,
+            blueSum.toDouble() / count
+        )
+    }
+
+    // ================================================
+    // CONVERTIR IMAGEPROXY A BITMAP
+    // ================================================
+
+    private fun imageProxyToBitmap(
+        image: ImageProxy
+    ): Bitmap {
 
         val plane = image.planes[0]
         val buffer = plane.buffer
+
         val startPosition = buffer.position()
 
         val width = image.width
@@ -448,14 +699,22 @@ class CaptureActivity : AppCompatActivity() {
 
             for (x in 0 until width) {
 
-                val index = startPosition +
-                        y * plane.rowStride +
-                        x * plane.pixelStride
+                val index =
+                    startPosition +
+                            y * plane.rowStride +
+                            x * plane.pixelStride
 
-                val r = buffer.get(index).toInt() and 0xFF
-                val g = buffer.get(index + 1).toInt() and 0xFF
-                val b = buffer.get(index + 2).toInt() and 0xFF
-                val a = buffer.get(index + 3).toInt() and 0xFF
+                val r =
+                    buffer.get(index).toInt() and 0xFF
+
+                val g =
+                    buffer.get(index + 1).toInt() and 0xFF
+
+                val b =
+                    buffer.get(index + 2).toInt() and 0xFF
+
+                val a =
+                    buffer.get(index + 3).toInt() and 0xFF
 
                 pixels[y * width + x] =
                     (a shl 24) or
@@ -481,8 +740,8 @@ class CaptureActivity : AppCompatActivity() {
             height
         )
 
-        // Corregimos la orientación de la imagen.
-        val rotation = image.imageInfo.rotationDegrees
+        val rotation =
+            image.imageInfo.rotationDegrees
 
         if (rotation == 0) {
             return bitmap
@@ -503,13 +762,160 @@ class CaptureActivity : AppCompatActivity() {
         )
     }
 
-    // Liberamos los recursos al cerrar la pantalla.
+    // ================================================
+    // INICIAR CÁMARA CON CAMERAX
+    // ================================================
+
+    private fun startCamera() {
+
+        val cameraProviderFuture =
+            ProcessCameraProvider.getInstance(this)
+
+        cameraProviderFuture.addListener({
+
+            val cameraProvider =
+                cameraProviderFuture.get()
+
+            val preview = Preview.Builder().build()
+
+            preview.surfaceProvider =
+                binding.cameraPreview.surfaceProvider
+
+            val imageAnalysis =
+                ImageAnalysis.Builder()
+                    .setBackpressureStrategy(
+                        ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST
+                    )
+                    .setOutputImageFormat(
+                        ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888
+                    )
+                    .build()
+
+            imageAnalysis.setAnalyzer(analysisExecutor) { imageProxy ->
+
+                if (
+                    !detectorReady ||
+                    isFinishing ||
+                    isDestroyed
+                ) {
+                    imageProxy.close()
+                    return@setAnalyzer
+                }
+
+                if (!isProcessing.compareAndSet(false, true)) {
+                    imageProxy.close()
+                    return@setAnalyzer
+                }
+
+                try {
+
+                    pendingOutputTransform =
+                        imageProxyTransformFactory.getOutputTransform(
+                            imageProxy
+                        )
+
+                    val bitmap =
+                        imageProxyToBitmap(imageProxy)
+
+                    pendingBitmap = bitmap
+
+                    pendingTimestampMs =
+                        imageProxy.imageInfo.timestamp / 1_000_000
+
+                    val mpImage =
+                        BitmapImageBuilder(bitmap).build()
+
+                    faceLandmarkerHelper.detectAsync(
+                        mpImage,
+                        pendingTimestampMs
+                    )
+
+                } catch (exception: Exception) {
+
+                    pendingBitmap = null
+                    isProcessing.set(false)
+
+                    Log.e(
+                        "MediaPipe",
+                        "Error al procesar imagen",
+                        exception
+                    )
+
+                } finally {
+
+                    imageProxy.close()
+                }
+            }
+
+            val cameraSelector =
+                CameraSelector.DEFAULT_FRONT_CAMERA
+
+            try {
+
+                cameraProvider.unbindAll()
+
+                val viewPort =
+                    binding.cameraPreview.viewPort
+
+                if (viewPort == null) {
+
+                    Log.e(
+                        "CameraX",
+                        "No se pudo obtener el ViewPort"
+                    )
+
+                    return@addListener
+                }
+
+                val useCaseGroup =
+                    UseCaseGroup.Builder()
+                        .setViewPort(viewPort)
+                        .addUseCase(preview)
+                        .addUseCase(imageAnalysis)
+                        .build()
+
+                cameraProvider.bindToLifecycle(
+                    this,
+                    cameraSelector,
+                    useCaseGroup
+                )
+
+                Log.d(
+                    "CameraX",
+                    "Cámara frontal iniciada correctamente"
+                )
+
+            } catch (exception: Exception) {
+
+                Log.e(
+                    "CameraX",
+                    "Error al iniciar cámara",
+                    exception
+                )
+
+                Toast.makeText(
+                    this,
+                    "No se pudo iniciar la cámara",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    // ================================================
+    // DESTRUIR ACTIVITY
+    // ================================================
+
     override fun onDestroy() {
-        super.onDestroy()
+
+        isCapturing = false
+
+        mainHandler.removeCallbacks(captureTimer)
 
         detectorReady = false
 
-
+        pendingBitmap = null
 
         if (::faceLandmarkerHelper.isInitialized) {
             faceLandmarkerHelper.close()
@@ -518,5 +924,7 @@ class CaptureActivity : AppCompatActivity() {
         if (::analysisExecutor.isInitialized) {
             analysisExecutor.shutdown()
         }
+
+        super.onDestroy()
     }
 }
