@@ -32,19 +32,17 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent"/>
 
-    <TextView
-        android:id="@+id/txtCameraPlaceholder"
-        android:layout_width="250dp"
-        android:layout_height="320dp"
-        android:text="Aquí aparecerá la cámara frontal"
-        android:textColor="#40D6C5"
-        android:textSize="18sp"
-        android:gravity="center"
+    <androidx.camera.view.PreviewView
+        android:id="@+id/cameraPreview"
+        android:layout_width="280dp"
+        android:layout_height="360dp"
         android:background="#172337"
+        app:implementationMode="compatible"
+        app:scaleType="fitCenter"
         app:layout_constraintTop_toBottomOf="@id/txtInstructions"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
-        android:layout_marginTop="20dp"/>
+        android:layout_marginTop="20dp" />
 
     <Button
         android:id="@+id/btnBack"
